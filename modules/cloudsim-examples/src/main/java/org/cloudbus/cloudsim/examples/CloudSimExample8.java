@@ -130,8 +130,8 @@ public class CloudSimExample8 {
 			int brokerId = broker.getId();
 
 			//Fourth step: Create VMs and Cloudlets and send them to broker
-			vmList = createVM(brokerId, 5, 0); //creating 5 vms
-			cloudletList = createCloudlet(brokerId, 10, 0); // creating 10 cloudlets
+			vmList = createVM(brokerId, 24, 0); //creating 5 vms
+			cloudletList = createCloudlet(brokerId, 24, 0); // creating 10 cloudlets
 
 			broker.submitVmList(vmList);
 			broker.submitCloudletList(cloudletList);
@@ -168,7 +168,7 @@ public class CloudSimExample8 {
 		//    a Machine.
 		List<Pe> peList1 = new ArrayList<Pe>();
 
-		int mips = 1000;
+		int mips = 1500;
 
 		// 3. Create PEs and add these into the list.
 		//for a quad-core machine, a list of 4 PEs is required:
@@ -187,7 +187,7 @@ public class CloudSimExample8 {
 		int hostId=0;
 		int ram = 16384; //host memory (MB)
 		long storage = 1000000; //host storage
-		int bw = 10000;
+		int bw = 18000;
 
 		hostList.add(
     			new Host(
@@ -304,8 +304,8 @@ public class CloudSimExample8 {
 				setBroker(createBroker(super.getName()+"_"));
 
 				//Create VMs and Cloudlets and send them to broker
-				setVmList(createVM(getBroker().getId(), 5, 100)); //creating 5 vms
-				setCloudletList(createCloudlet(getBroker().getId(), 10, 100)); // creating 10 cloudlets
+				setVmList(createVM(getBroker().getId(), 24, 100)); //creating 5 vms
+				setCloudletList(createCloudlet(getBroker().getId(), 24, 100)); // creating 10 cloudlets
 
 				broker.submitVmList(getVmList());
 				broker.submitCloudletList(getCloudletList());
