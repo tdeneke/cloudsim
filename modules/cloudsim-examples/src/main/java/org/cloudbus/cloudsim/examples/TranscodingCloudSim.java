@@ -49,7 +49,7 @@ import org.cloudbus.cloudsim.provisioners.RamProvisionerSimple;
  * this example) in run-time using a globar manager entity (GlobalBroker).
  */
 public class TranscodingCloudSim {
-
+    private final static long MIPS = 124162;
     ////////////////////////// STATIC METHODS ///////////////////////
     /**
      * Creates main() to run this example
@@ -76,7 +76,7 @@ public class TranscodingCloudSim {
 
             // Third step: create broker and workload generator entities
             TranscodingDatacenterBroker broker = createBroker("TranscodingBroker_0");
-            TranscodingWorkLoadGenerator genrator = new TranscodingWorkLoadGenerator("TranscodingWorkLoadGenerator_0",broker);
+            TranscodingWorkLoadGenerator generator = new TranscodingWorkLoadGenerator("TranscodingWorkLoadGenerator_0",broker);
 
             // Forth step: Starts the simulation. job creation, and vm managment will be 
             // taken care of by golbal and datasenter brokers  
@@ -89,7 +89,7 @@ public class TranscodingCloudSim {
 
             CloudSim.stopSimulation();
 
-            printCloudletList(newList);
+            printCloudletList(newList, generator.getCloudletResultsWriter());
 
             Log.printLine("TransodingCloudSim finished!");
         } catch (Exception e) {
@@ -110,7 +110,7 @@ public class TranscodingCloudSim {
         //    a Machine.
         List<Pe> peList1 = new ArrayList<Pe>();
 
-        long mips = 124162 * 4 * 1000; //enough mips 
+        long mips = 124162 * 4 * 200; //enough mips 
 
         // 3. Create PEs and add these into the list.
         //for a quad-core machine, a list of 4 PEs is required:
@@ -188,27 +188,40 @@ public class TranscodingCloudSim {
      *
      * @param list list of Cloudlets
      */
-    private static void printCloudletList(List<Cloudlet> list) {
+    private static void printCloudletList(List<Cloudlet> list, BufferedWriter writer) throws IOException {
         int size = list.size();
-        Cloudlet cloudlet;
+        TranscodingCloudlet cloudlet;
 
         String indent = "    ";
         Log.printLine();
         Log.printLine("========== OUTPUT ==========");
         Log.printLine("Cloudlet ID" + indent + "STATUS" + indent
-                + "Data center ID" + indent + "VM ID" + indent + indent + "Time" + indent + "Start Time" + indent + "Finish Time");
-
+                + "Data center ID" + indent + "VM ID" + indent + indent + "Time" + indent + "Submitted Time" + indent + "Start Time" + indent + "Finish Time");
+        writer.write("Cloudlet ID" + "\t" + "STATUS" + "\t"
+                + "Data center ID" + "\t" + "VM ID" + "\t" + "Time" + "\t" + "Submitted Time" + "\t" + "Start Time" + "\t" + "Finish Time" + "\t" + "Waiting Time" + "\t" + "Est. Waiting Time");
+        writer.newLine();
+        
         DecimalFormat dft = new DecimalFormat("###.##");
         for (int i = 0; i < size; i++) {
-            cloudlet = list.get(i);
+            cloudlet = (TranscodingCloudlet)list.get(i);
             Log.print(indent + cloudlet.getCloudletId() + indent + indent);
+            writer.write(cloudlet.getCloudletId() + "\t");
 
             if (cloudlet.getCloudletStatus() == Cloudlet.SUCCESS) {
                 Log.print("SUCCESS");
+                writer.write("1");
 
                 Log.printLine(indent + indent + cloudlet.getResourceId() + indent + indent + indent + cloudlet.getVmId()
                         + indent + indent + indent + dft.format(cloudlet.getActualCPUTime())
+                        + indent + indent + indent + dft.format(cloudlet.getSubmissionTime())
                         + indent + indent + dft.format(cloudlet.getExecStartTime()) + indent + indent + indent + dft.format(cloudlet.getFinishTime()));
+                writer.write("\t" + cloudlet.getResourceId() + "\t" + cloudlet.getVmId()
+                        + "\t" + dft.format(cloudlet.getActualCPUTime())
+                        + "\t" + dft.format(cloudlet.getSubmissionTime())
+                        + "\t" + dft.format(cloudlet.getExecStartTime()) 
+                        + "\t" + dft.format(cloudlet.getFinishTime())
+                        + "\t" + dft.format(cloudlet.getExecStartTime() - cloudlet.getSubmissionTime())
+                        + "\t" + dft.format(cloudlet.getPredictedWaitingLength()/MIPS)+ "\n");
             }
         }
 
@@ -217,13 +230,15 @@ public class TranscodingCloudSim {
     public static class TranscodingWorkLoadGenerator extends SimEntity {
 
         private final static int CREATE_JOBS = 1;
-        private final static long MIPS = 124162;
+        //private final static long MIPS = 124162;
         private static BufferedReader arrivalsReader;
         private static BufferedReader videosReader;
         private static BufferedWriter resultsWriter;
-        private final static String arrivalsFileName = "/home/tdeneke/Papers/Proactive_Management/experiment/bambuser_5sec_arrival_count_first_day.csv";
-        private final static String videosFileName = "/home/tdeneke/Papers/Proactive_Management/experiment/nn_tr_utime_prediction.csv";
-        private final static String resultsFileName = "/home/tdeneke/Papers/Proactive_Management/experiment/nn_provisioning_result.csv";
+        private static BufferedWriter cloudletResultsWriter;
+        private final static String arrivalsFileName = "/home/tdeneke/Papers/Proactive_Management/experiment/bambuser_5sec_arrival_count_first_week.csv";
+        private final static String videosFileName = "/home/tdeneke/Papers/Proactive_Management/experiment/nn_segment_prediction.csv";
+        private final static String resultsFileName = "/home/tdeneke/Papers/Proactive_Management/experiment/ideal_provisioning_result.csv";
+        private final static String cloudletResultsFileName = "/home/tdeneke/Papers/Proactive_Management/experiment/ideal_provisioning_cloudlet_result.csv";
 
         private final TranscodingDatacenterBroker broker;
         private List<Cloudlet> cloudletList;
@@ -254,6 +269,7 @@ public class TranscodingCloudSim {
             //default cloudlet parameters. will be read from input experimental file
             long length = 40000;
             long predictedLength = (long) (length * 0.95);
+            long frames = 300;
             long fileSize = 300;
             long outputSize = 300;
             int pesNumber = 1;
@@ -263,7 +279,9 @@ public class TranscodingCloudSim {
 
                 if (arrivalsReader.ready() && (readLine = arrivalsReader.readLine()) != null) {
                     arrivals = Integer.parseInt(readLine);
-                    arrivals = (int)(arrivals / 5); //faster simulation for bambuser
+                    //we assume transcoding request is 120* less likely than streaming request
+                    //can be changed as needed.
+                    arrivals = (int)(arrivals / 20); 
                 } else {
                     broker.setEndOfSimulation(true);
                     if (videosReader != null) {
@@ -283,9 +301,16 @@ public class TranscodingCloudSim {
                 for (int i = 0; i < arrivals; i++) {
                     if (videosReader.ready() && (readLine = videosReader.readLine()) != null) {
                         nnparams = readLine.split(";", -1);
-                        predictedLength = (long) Math.abs(MIPS * Double.parseDouble(nnparams[21]));
-                        length = (long) Math.abs(MIPS * Double.parseDouble(nnparams[20]));
-                        cloudlet[i] = new TranscodingCloudlet(cloudletId++, length, predictedLength, pesNumber, fileSize, outputSize, utilizationModel, utilizationModel, utilizationModel);
+                        
+                        //predictedLength = (long) Math.abs(MIPS * Double.parseDouble(nnparams[21]));
+                        //length = (long) Math.abs(MIPS * Double.parseDouble(nnparams[20]));
+                        
+                        predictedLength = (long) Math.abs(MIPS * Double.parseDouble(nnparams[18]));
+                        length = (long) Math.abs(MIPS * Double.parseDouble(nnparams[19]));
+                        //output video frames = (output video fps / input video fps) * input vodeo frames
+                        //frames = (long) Math.abs(Double.parseDouble(nnparams[16])*Double.parseDouble(nnparams[8])*Double.parseDouble(nnparams[4]));
+                        frames = (long) Math.abs(Double.parseDouble(nnparams[13])*Double.parseDouble(nnparams[7])*Double.parseDouble(nnparams[3]));
+                        cloudlet[i] = new TranscodingCloudlet(cloudletId++, length, predictedLength, frames, pesNumber, fileSize, outputSize, utilizationModel, utilizationModel, utilizationModel);
                         //setting the owner of these Cloudlets
                         cloudlet[i].setUserId(broker.getId());
                         list.add(cloudlet[i]);
@@ -316,13 +341,22 @@ public class TranscodingCloudSim {
                 Log.printLine(super.getName() + " is starting...");
                 // input output file readers and writers
                 resultsWriter = new BufferedWriter(new FileWriter(resultsFileName));
+                cloudletResultsWriter = new BufferedWriter(new FileWriter(cloudletResultsFileName));
                 arrivalsReader = new BufferedReader(new FileReader(arrivalsFileName));
-                videosReader = new BufferedReader(new FileReader(videosFileName));
-                String header = videosReader.readLine(); //skip header
-                header = arrivalsReader.readLine(); //skip header
+                videosReader = new BufferedReader(new FileReader(videosFileName)); 
+                String [] features = videosReader.readLine().split(";", -1);//skip header
+                //print important feature headers to check
+                //System.out.println(features[4] +"\t"+ features[8] +"\t"+ features[16] +"\t"+ features[20] +"\t"+ features[21]);
+                System.out.println(features[3] +"\t"+ features[7] +"\t"+ features[13] +"\t"+ features[18] +"\t"+ features[19]);
+
+                String header = arrivalsReader.readLine(); //skip header
                 broker.setResultWriter(resultsWriter); //pass the result file writer to broker
+                header = "vms" + "\t" + "predictedAVTime" + "\t" + "actualAVWaitingTime" + "\t" + "slaWaitingTime" + "\t" + "totalJobs" + "\t" + "totalPredictedTime" + "\t" + "totalPredictedFps" + "\t" + "totalActualTime" + "\t" + "totalActualFps" + "\t" + "avUtilization";
+                broker.getResultWriter().write(header);
+                broker.getResultWriter().newLine();
+        
                 System.out.println(header);
-                schedule(getId(), 5, CREATE_JOBS); //start generaating job after 5 sec.
+                schedule(getId(), 185, CREATE_JOBS); //start generaating job after 3 min.can be changed
             } catch (IOException ex) {
                 Logger.getLogger(TranscodingCloudSim.class.getName()).log(Level.SEVERE, null, ex);
             }
@@ -336,9 +370,14 @@ public class TranscodingCloudSim {
             return cloudletList;
         }
 
-        protected void setCloudletList(List<Cloudlet> cloudletList) {
+        public void setCloudletList(List<Cloudlet> cloudletList) {
             this.cloudletList = cloudletList;
         }
+        
+        public BufferedWriter getCloudletResultsWriter() {
+            return cloudletResultsWriter;
+        }
+
 
     }
 

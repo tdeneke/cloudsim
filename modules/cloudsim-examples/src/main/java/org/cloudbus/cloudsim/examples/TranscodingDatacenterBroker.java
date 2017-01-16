@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.apache.commons.math3.stat.descriptive.moment.Mean;
 
 import org.cloudbus.cloudsim.core.CloudSim;
 import org.cloudbus.cloudsim.core.CloudSimTags;
@@ -25,6 +26,7 @@ import org.cloudbus.cloudsim.lists.CloudletList;
 import org.cloudbus.cloudsim.lists.VmList;
 import org.cloudbus.cloudsim.Cloudlet;
 import org.cloudbus.cloudsim.CloudletSchedulerTimeShared;
+import org.cloudbus.cloudsim.CloudletSchedulerSpaceShared;
 import org.cloudbus.cloudsim.Vm;
 import org.cloudbus.cloudsim.DatacenterCharacteristics;
 import org.cloudbus.cloudsim.Log;
@@ -105,18 +107,20 @@ public class TranscodingDatacenterBroker extends SimEntity {
      */
     protected Map<Integer, DatacenterCharacteristics> datacenterCharacteristicsList;
 
-    private static final int VM_CREATE_REQ = 200;
-    private static final int VM_DESTROY_REQ = 201;
+    private static final int VM_PROVISION_REQ = 200;
     private static final int CLOUDLET_SUBMIT_REQ = 202;
     private static final long MIPS = 124162;
-    private static final int BASE_NO_VMS = 2000;
-    private static final double SLA_WAITING_TIME = 3*60;
-    private static final int MIN_INTERVAL = 9 * 60;
-    private static final double RENTING_TIME = 60*60;
-    private static final double UPPER_THRESHOLD = 15*60;
-    private static final double LOWER_THRESHOLD = 5*60; 
-    protected Map<Integer, Integer> VmsToJobCountMap;
-    protected Map<Integer, Long> VmsToJobLoadMap;
+    private static final int BASE_NO_VMS = 3;
+    private static final double SLA_WAITING_TIME = 3 * 60;
+    private static final int MIN_INTERVAL = 30 * 60;
+    private static final double RENTING_TIME = 60 * 60;
+    private static final double UPPER_THRESHOLD = 15 * 60;
+    private static final double LOWER_THRESHOLD = 5 * 60;
+    protected Map<Integer, Integer> vmsToJobCountMap;
+    protected Map<Integer, Long> vmsToJobLoadMap;
+    protected Map<Integer, Long> vmsToActualJobLoadMap;
+    protected Map<Integer, Long> vmsToFramesMap;
+    protected Mean avWaitingTime;
     protected BufferedWriter bw;
     protected String lbAlgo;
     protected int vmId;
@@ -153,7 +157,10 @@ public class TranscodingDatacenterBroker extends SimEntity {
         setDatacenterCharacteristicsList(new HashMap<Integer, DatacenterCharacteristics>());
         setVmsToJobCountMap(new HashMap<Integer, Integer>());
         setVmsToJobLoadMap(new HashMap<Integer, Long>());
-        setLbAlgo("qlen");
+        setVmsToActualJobLoadMap(new HashMap<Integer, Long>());
+        setVmsToFramesMap(new HashMap<Integer, Long>());
+        setAvWaitingTime(new Mean());
+        setLbAlgo("nn");
         setEndOfSimulation(false);
 
         vmId = 0;
@@ -177,7 +184,7 @@ public class TranscodingDatacenterBroker extends SimEntity {
         TranscodingVm[] vm = new TranscodingVm[vms];
 
         for (int i = 0; i < vms; i++) {
-            vm[i] = new TranscodingVm(idShift + i, userId, mips, pesNumber, ram, bw, size, vmm, new CloudletSchedulerTimeShared(), CloudSim.clock(), RENTING_TIME);
+            vm[i] = new TranscodingVm(idShift + i, userId, mips, pesNumber, ram, bw, size, vmm, new CloudletSchedulerSpaceShared(), CloudSim.clock(), RENTING_TIME);
             list.add(vm[i]);
         }
 
@@ -239,19 +246,14 @@ public class TranscodingDatacenterBroker extends SimEntity {
                 processResourceCharacteristics(ev);
                 break;
             // VM Creation request 
-            case VM_CREATE_REQ:
+            case VM_PROVISION_REQ:
                 //processVmCreateReq(ev);
-                createVmsInDatacenter(getDatacenterIdsList().get(0));
+                provision(getDatacenterIdsList().get(0));
                 break;
             // VM Creation answer
             case CloudSimTags.VM_CREATE_ACK:
                 processVmCreate(ev);
                 break;
-            // VM Destroy request 
-            case VM_DESTROY_REQ:
-                destroyVmsInDatacenter(getDatacenterIdsList().get(0));
-                break;
-            // VM Destroy answer
             case CloudSimTags.VM_DESTROY_ACK:
                 processVmDestroy(ev);
                 break;
@@ -328,6 +330,9 @@ public class TranscodingDatacenterBroker extends SimEntity {
             getVmsCreatedList().add(VmList.getById(getVmList(), vmId));
             getVmsToJobCountMap().put(vmId, 0);
             getVmsToJobLoadMap().put(vmId, 0L);
+            getVmsToActualJobLoadMap().put(vmId, 0L);
+            getVmsToFramesMap().put(vmId, 0L);
+
             Log.printConcatLine(CloudSim.clock(), ": ", getName(), ": VM #", vmId,
                     " has been created in Datacenter #", datacenterId);
             ((TranscodingVm) VmList.getById(getVmsCreatedList(), vmId)).setStartTime(CloudSim.clock());
@@ -357,6 +362,9 @@ public class TranscodingDatacenterBroker extends SimEntity {
             getVmsCreatedList().remove(VmList.getById(getVmList(), vmId));
             getVmsToJobCountMap().remove(vmId);
             getVmsToJobLoadMap().remove(vmId);
+            getVmsToActualJobLoadMap().remove(vmId);
+            getVmsToFramesMap().remove(vmId);
+
             Log.printConcatLine(CloudSim.clock(), ": ", getName(), ": VM #", vmId,
                     " has been removed from Datacenter #", datacenterId);
             lastModifiedAt = CloudSim.clock();
@@ -379,10 +387,14 @@ public class TranscodingDatacenterBroker extends SimEntity {
     protected void processCloudletReturn(SimEvent ev) {
         TranscodingCloudlet cloudlet = (TranscodingCloudlet) ev.getData();
         getCloudletReceivedList().add(cloudlet);
-        Log.printConcatLine(CloudSim.clock(), ": ", getName(), ": Cloudlet ", cloudlet.getCloudletId()," received");
-        getVmsToJobCountMap().put(cloudlet.getVmId(), getVmsToJobCountMap().get(cloudlet.getVmId()) - 1); 
+        Log.printConcatLine(CloudSim.clock(), ": ", getName(), ": Cloudlet ", cloudlet.getCloudletId(), " received");
+        getVmsToJobCountMap().put(cloudlet.getVmId(), getVmsToJobCountMap().get(cloudlet.getVmId()) - 1);
         getVmsToJobLoadMap().put(cloudlet.getVmId(), getVmsToJobLoadMap().get(cloudlet.getVmId()) - cloudlet.getPredictedCloudletLength());
-        cloudletsSubmitted--;  
+        getVmsToActualJobLoadMap().put(cloudlet.getVmId(), getVmsToActualJobLoadMap().get(cloudlet.getVmId()) - cloudlet.getCloudletLength());
+        getVmsToFramesMap().put(cloudlet.getVmId(), getVmsToFramesMap().get(cloudlet.getVmId()) - cloudlet.getFrames());
+        getAvWaitingTime().increment(cloudlet.getExecStartTime() - cloudlet.getSubmissionTime());
+
+        cloudletsSubmitted--;
     }
 
     /**
@@ -409,130 +421,87 @@ public class TranscodingDatacenterBroker extends SimEntity {
      * @pre $none
      * @post $none
      */
-    protected void createVmsInDatacenter(int datacenterId) {
+    protected void provision(int datacenterId) {
 
         try {
-            
+
             // if end of simulation stop scheduling 
-            if(getEndOfSimulation())
+            if (getEndOfSimulation()) {
                 return;
-            
+            }
+
             // request additional or removal of n VMs
             int requestedVms = 0;
             String datacenterName = CloudSim.getEntityName(datacenterId);
             int vmsToRequest = calculateProvision(getResultWriter());
 
-            // removal, just schedule next vm creation
-            if (vmsToRequest <= 0) {
-                schedule(getId(), 180, VM_CREATE_REQ);
-                return;
-            }
-
+            Log.printLine(CloudSim.clock() + "last modified before: " + (CloudSim.clock() - lastModifiedAt));    
             // if not recently modified
             if ((CloudSim.clock() - lastModifiedAt) > MIN_INTERVAL) {
-                
-                // unflag vms instead of creating new; previously flagged vms 
-                // does not get new jobs as they are candidates for removal
-                for (Vm vm : getVmsCreatedList()) {
-                    if (vmsToRequest == 0) {
-                        break;
-                    }
-                    if (((TranscodingVm) vm).getCloseToComplete()) {
-                        ((TranscodingVm) vm).setCloseToComplete(false);
-                        vmsToRequest--;
-                    }
-                }
 
-                // create more new vms if needed
-                for (Vm vm : createVM(getId(), vmsToRequest, vmId)) {
-                    if (!getVmsToDatacentersMap().containsKey(vm.getId())) {
-                        Log.printLine(CloudSim.clock() + ": " + getName() + ": Trying to Create VM #" + vm.getId()
-                                + " in " + datacenterName);
-                        sendNow(datacenterId, CloudSimTags.VM_CREATE_ACK, vm);
-                        getVmList().add(vm);
-                        requestedVms++;
+                if (vmsToRequest > 0) {
+                    // unflag vms instead of creating new; previously flagged vms 
+                    // does not get new jobs as they are candidates for removal
+                    for (Vm vm : getVmsCreatedList()) {
+                        if (vmsToRequest == 0) {
+                            break;
+                        }
+                        if (((TranscodingVm) vm).getCloseToComplete()) {
+                            ((TranscodingVm) vm).setCloseToComplete(false);
+                            vmsToRequest--;
+                        }
+                    }
+
+                    // create more new vms if needed
+                    for (Vm vm : createVM(getId(), vmsToRequest, vmId)) {
+                        if (!getVmsToDatacentersMap().containsKey(vm.getId())) {
+                            Log.printLine(CloudSim.clock() + ": " + getName() + ": Trying to Create VM #" + vm.getId()
+                                    + " in " + datacenterName);
+                            sendNow(datacenterId, CloudSimTags.VM_CREATE_ACK, vm);
+                            getVmList().add(vm);
+                            requestedVms++;
+                        }
+                    }
+                    vmsToRequest = 0;
+                } else {
+
+                    // destroy vms which are flagd and have no job queued
+                    for (Vm vm : getVmsCreatedList()) {
+                        if (vmsToRequest == 0) {
+                            break;
+                        }
+                        System.out.println("about to destroy vm");
+                        if (((TranscodingVm) vm).getCloseToComplete() && getVmsToJobCountMap().get(vm.getId()) == 0) {
+                            Log.printConcatLine(CloudSim.clock(), ": " + getName(), ": Destroying VM #", vm.getId(), "in datacenter " + datacenterName);
+                            sendNow(datacenterId, CloudSimTags.VM_DESTROY_ACK, vm);
+                            vmsToRequest++;
+                        }
+                    }
+
+                    // flag the rest; flagged vms don't get new jobs and are 
+                    // candidates to be removed once they finished their job or become 
+                    // unflgged. 
+                    for (Vm vm : getVmsCreatedList()) {
+                        if (vmsToRequest == 0) {
+                            break;
+                        }
+                        ((TranscodingVm) vm).setRemainingTime(((TranscodingVm) vm).getRentingTime() - ((CloudSim.clock() - ((TranscodingVm) vm).getStartTime()) % ((TranscodingVm) vm).getRentingTime()));
+                        if (LOWER_THRESHOLD < (int) (((TranscodingVm) vm).getRemainingTime()) && (int) (((TranscodingVm) vm).getRemainingTime()) < UPPER_THRESHOLD) {
+                            ((TranscodingVm) vm).setCloseToComplete(true);
+                            System.out.println("flaged vm!");
+                            vmsToRequest++;
+                        }
+
                     }
                 }
 
             }
-            
+
             vmId = vmId + requestedVms;
             getDatacenterRequestedIdsList().add(datacenterId);
             setVmsRequested(getVmsRequested() + requestedVms);
-            schedule(getId(), 180, VM_CREATE_REQ);
+            schedule(getId(), 300, VM_PROVISION_REQ);
 
-        } catch (IOException ex) {
-            Logger.getLogger(TranscodingDatacenterBroker.class.getName()).log(Level.SEVERE, null, ex);
-            System.out.println("Problem writing results");
-        }
-    }
-
-    /**
-     * Destroy virtual machines in a datacenter.
-     *
-     * @param datacenterId Id of the chosen PowerDatacenter
-     * @pre $none
-     * @post $none
-     */
-    protected void destroyVmsInDatacenter(int datacenterId) {
-
-        try {
-            
-            // if end of simulation stop scheduling 
-            if(getEndOfSimulation())
-                return;
-            
-            // request n additional VMs
-            String datacenterName = CloudSim.getEntityName(datacenterId); 
-            int vmsToDestroy = calculateProvision(getResultWriter());
-
-            // we expect negative value for vmsToDestroy; posotive vmsToDestroy
-            // means we need to create more.
-            if (vmsToDestroy >= 0) {
-                schedule(getId(), 180, VM_DESTROY_REQ);
-                return;
-            }
-
-            // if not modified recently 
-            if ((CloudSim.clock() - lastModifiedAt) > MIN_INTERVAL) {
-                
-                // destroy vms which are flagd and have no job queued
-                for (Vm vm : getVmsCreatedList()) {
-                    if (vmsToDestroy == 0) {
-                        break;
-                    }
-                    System.out.println("about to destroy vm");
-                    if (((TranscodingVm) vm).getCloseToComplete() && getVmsToJobCountMap().get(vm.getId()) == 0) {
-                        Log.printConcatLine(CloudSim.clock(), ": " + getName(), ": Destroying VM #", vm.getId(), "in datacenter " + datacenterName);
-                        sendNow(datacenterId, CloudSimTags.VM_DESTROY_ACK, vm);
-                        vmsToDestroy ++;
-                    }
-                }
-                
-                // flag the rest; flagged vms don't get new jobs and are 
-                // candidates to be removed once they finished their job or become 
-                // unflgged. 
-                for (Vm vm : getVmsCreatedList()) {
-                    if (vmsToDestroy == 0) {
-                        break;
-                    }
-                    ((TranscodingVm)vm).setRemainingTime( ((TranscodingVm) vm).getRentingTime() - ((CloudSim.clock() - ((TranscodingVm) vm).getStartTime()) %  ((TranscodingVm) vm).getRentingTime()));
-                    if (  LOWER_THRESHOLD < (int)(((TranscodingVm)vm).getRemainingTime()) && (int)(((TranscodingVm)vm).getRemainingTime()) < UPPER_THRESHOLD) {
-                        ((TranscodingVm) vm).setCloseToComplete(true);
-                        System.out.println("flaged vm!");
-                        vmsToDestroy ++;
-                    }
-
-                }
-
-            }
-
-            getDatacenterRequestedIdsList().add(datacenterId);
-
-            //setVmsRequested(requestedVms);
-            //setVmsAcks(0);
-            //setVmsRequested(getVmsRequested() + requestedVms);
-            schedule(getId(), 180, VM_DESTROY_REQ);
         } catch (IOException ex) {
             Logger.getLogger(TranscodingDatacenterBroker.class.getName()).log(Level.SEVERE, null, ex);
             System.out.println("Problem writing results");
@@ -546,11 +515,12 @@ public class TranscodingDatacenterBroker extends SimEntity {
      * @post $none
      */
     protected void submitCloudlets() {
-        
+
         // if end of simulation stop scheduling 
-        if(getEndOfSimulation())
+        if (getEndOfSimulation()) {
             return;
-        
+        }
+
         if (getVmsCreatedList().size() == 0) {
             schedule(getId(), 5, CLOUDLET_SUBMIT_REQ);
             return;
@@ -575,6 +545,7 @@ public class TranscodingDatacenterBroker extends SimEntity {
             Log.printLine(CloudSim.clock() + ": " + getName() + ": Sending cloudlet "
                     + cloudlet.getCloudletId() + " to VM #" + vm.getId());
             cloudlet.setVmId(vm.getId());
+            cloudlet.setPredictedWaitingLength(getVmsToJobLoadMap().get(vm.getId()));
 
             //cloudlet.transcodingRate = cloudlet.streamPlayRate;
             sendNow(getVmsToDatacentersMap().get(vm.getId()), CloudSimTags.CLOUDLET_SUBMIT, cloudlet);
@@ -583,6 +554,8 @@ public class TranscodingDatacenterBroker extends SimEntity {
             //increase the job count and load of each vm
             getVmsToJobCountMap().put(vm.getId(), getVmsToJobCountMap().get(vm.getId()) + 1);
             getVmsToJobLoadMap().put(vm.getId(), getVmsToJobLoadMap().get(vm.getId()) + cloudlet.getPredictedCloudletLength());
+            getVmsToActualJobLoadMap().put(vm.getId(), getVmsToActualJobLoadMap().get(vm.getId()) + cloudlet.getCloudletLength());
+            getVmsToFramesMap().put(vm.getId(), getVmsToFramesMap().get(vm.getId()) + cloudlet.getFrames());
 
             vmIndex = getBestVmIndex();
             getCloudletSubmittedList().add(cloudlet);
@@ -593,6 +566,94 @@ public class TranscodingDatacenterBroker extends SimEntity {
             getCloudletList().remove(cloudlet);
         }
         schedule(getId(), 5, CLOUDLET_SUBMIT_REQ);
+    }
+
+    public int calculateProvision(BufferedWriter bw) throws IOException {
+
+        int vmsToAdd = 0;
+        List<Vm> vmList = getVmsCreatedList();
+
+        if (getVmsCreatedList().size() == 0) {
+            return BASE_NO_VMS;
+        }
+
+        long totalTime = this.getVmsToJobLoadMap().get(getVmsCreatedList().get(0).getId());
+        long totalActualTime = this.getVmsToActualJobLoadMap().get(getVmsCreatedList().get(0).getId());
+        long totalFrames = this.getVmsToFramesMap().get(getVmsCreatedList().get(0).getId());
+        long totalJobs = this.getVmsToJobCountMap().get(getVmsCreatedList().get(0).getId());
+        double totalUtilization = getVmsCreatedList().get(0).getTotalUtilizationOfCpu(CloudSim.clock());
+        for (int i = 1; i < getVmsCreatedList().size(); i++) {
+            totalTime = totalTime + getVmsToJobLoadMap().get(getVmsCreatedList().get(i).getId());
+            totalActualTime = totalActualTime + getVmsToActualJobLoadMap().get(getVmsCreatedList().get(i).getId());
+            totalFrames = totalFrames + getVmsToFramesMap().get(getVmsCreatedList().get(i).getId());
+            totalJobs = totalJobs + getVmsToJobCountMap().get(getVmsCreatedList().get(i).getId());
+            totalUtilization = totalUtilization + getVmsCreatedList().get(i).getTotalUtilizationOfCpu(CloudSim.clock());
+        }
+        
+        long minWaitTime = (getVmsToJobLoadMap().get(getVmsCreatedList().get(getBestVmIndex()).getId())) / MIPS;
+        double predictedFps = (totalFrames / (1 + (totalTime / MIPS))) * getVmsCreatedList().size();
+        double actualFps = (totalFrames / (1 + (totalActualTime / MIPS))) * getVmsCreatedList().size();
+        double predictedAvTime = (double) ((totalTime / MIPS) / getVmsCreatedList().size());
+        //double avWaitingTime = (double) ((totalTime / MIPS) / getVmsCreatedList().size());
+        //vmsToAdd = (int) ((totalTime / MIPS) / (0.95 * SLA_WAITING_TIME)) - getVmsCreatedList().size();
+        //vmsToAdd = (int) (totalTime / ((SLA_WAITING_TIME + getVmsCreatedList().size())*MIPS)) - getVmsCreatedList().size();
+        //vmsToAdd = (int) (9 * ((getVmsCreatedList().size())*MIPS)/totalTime) - getVmsCreatedList().size();
+        //vmsToAdd = (int) (totalTime / ((SLA_WAITING_TIME + predictedAvTime)*MIPS)) - getVmsCreatedList().size();
+        //vmsToAdd = (int) (((getAvWaitingTime().getResult()/SLA_WAITING_TIME) - 1) * getVmsCreatedList().size());
+        vmsToAdd = (int) (((predictedAvTime/(0.20*SLA_WAITING_TIME)) - 1) * getVmsCreatedList().size());
+        //vmsToAdd = (int) (((predictedFps/actualFps) - 1) * getVmsCreatedList().size());
+        
+        Log.printLine(CloudSim.clock() + "Provisioned : " + vmsToAdd + " Virtual Machines ");
+        //we use +1 to avoid divid by zero
+        String writeString = getVmsCreatedList().size() + "\t" + predictedAvTime + "\t" + getAvWaitingTime().getResult() + "\t" + SLA_WAITING_TIME + "\t" + totalJobs + "\t" + totalTime / MIPS + "\t" + (totalFrames / (1 + (totalTime / MIPS))) * getVmsCreatedList().size() + "\t" + totalActualTime / MIPS + "\t" + (totalFrames / (1 + (totalActualTime / MIPS))) * getVmsCreatedList().size() + "\t" + totalUtilization / (1 + getVmsCreatedList().size()) + "\n";
+        bw.write(writeString);
+        //bw.newLine();
+        bw.flush();
+        return vmsToAdd;
+    }
+
+    protected int getBestVmIndex() {
+
+        int vmSelected = 0;
+        if (this.lbAlgo.equals("qlen")) {
+            double vmJobCount;
+            vmJobCount = getVmsToJobCountMap().get(getVmsCreatedList().get(0).getId());
+            for (int i = 1; i < getVmsCreatedList().size(); i++) {
+                if (vmJobCount > getVmsToJobCountMap().get(getVmsCreatedList().get(i).getId())) {
+                    TranscodingVm vm = (TranscodingVm) getVmsCreatedList().get(i);
+                    if (vm.getCloseToComplete() == false) {
+                        vmJobCount = getVmsToJobCountMap().get(getVmsCreatedList().get(i).getId());
+                        vmSelected = i;
+                    }
+                }
+            }
+        } else if (this.lbAlgo.equals("ideal")) {
+            long vmJobLoad;
+            vmJobLoad = getVmsToActualJobLoadMap().get(getVmsCreatedList().get(0).getId());
+            for (int i = 1; i < getVmsCreatedList().size(); i++) {
+                if (vmJobLoad > getVmsToActualJobLoadMap().get(getVmsCreatedList().get(i).getId())) {
+                    TranscodingVm vm = (TranscodingVm) getVmsCreatedList().get(i);
+                    if (vm.getCloseToComplete() == false) {
+                        vmJobLoad = getVmsToActualJobLoadMap().get(getVmsCreatedList().get(i).getId());
+                        vmSelected = i;
+                    }
+                }
+            }
+        } else {
+            long vmJobLoad;
+            vmJobLoad = getVmsToJobLoadMap().get(getVmsCreatedList().get(0).getId());
+            for (int i = 1; i < getVmsCreatedList().size(); i++) {
+                if (vmJobLoad > getVmsToJobLoadMap().get(getVmsCreatedList().get(i).getId())) {
+                    TranscodingVm vm = (TranscodingVm) getVmsCreatedList().get(i);
+                    if (vm.getCloseToComplete() == false) {
+                        vmJobLoad = getVmsToJobLoadMap().get(getVmsCreatedList().get(i).getId());
+                        vmSelected = i;
+                    }
+                }
+            }
+        }
+        return vmSelected;
+
     }
 
     /**
@@ -626,11 +687,12 @@ public class TranscodingDatacenterBroker extends SimEntity {
      */
     @Override
     public void shutdownEntity() {
-        if(this.bw != null)
+        if (this.bw != null) {
             try {
                 this.bw.close();
-        } catch (IOException ex) {
-            Logger.getLogger(TranscodingDatacenterBroker.class.getName()).log(Level.SEVERE, null, ex);
+            } catch (IOException ex) {
+                Logger.getLogger(TranscodingDatacenterBroker.class.getName()).log(Level.SEVERE, null, ex);
+            }
         }
         Log.printConcatLine(getName(), " is shutting down...");
     }
@@ -643,9 +705,8 @@ public class TranscodingDatacenterBroker extends SimEntity {
     public void startEntity() {
         Log.printConcatLine(getName(), " is starting...");
         schedule(getId(), 0, CloudSimTags.RESOURCE_CHARACTERISTICS_REQUEST);
-        schedule(getId(), 2, VM_CREATE_REQ);
-        schedule(getId(), 2, VM_DESTROY_REQ);
-        schedule(getId(), 5, CLOUDLET_SUBMIT_REQ);
+        schedule(getId(), 180, VM_PROVISION_REQ);
+        schedule(getId(), 190, CLOUDLET_SUBMIT_REQ);
     }
 
     /**
@@ -887,83 +948,49 @@ public class TranscodingDatacenterBroker extends SimEntity {
         this.datacenterRequestedIdsList = datacenterRequestedIdsList;
     }
 
-    public int calculateProvision(BufferedWriter bw) throws IOException {
-
-        int vmsToAdd = 0;
-        List<Vm> vmList = getVmsCreatedList();
-        
-        if(getVmsCreatedList().size() == 0)
-            return BASE_NO_VMS;
-
-        long totalLoad = this.getVmsToJobLoadMap().get(getVmsCreatedList().get(0).getId());
-        for (int i = 1; i < getVmsCreatedList().size(); i++) {
-            totalLoad = totalLoad + getVmsToJobLoadMap().get(getVmsCreatedList().get(i).getId());
-        }
-
-        double avWaitingTime = (double)((totalLoad / MIPS ) / getVmsCreatedList().size());
-        vmsToAdd = (int)((totalLoad/MIPS) / SLA_WAITING_TIME) -  getVmsCreatedList().size();
-
-        Log.printLine(CloudSim.clock() + "Provisioned : " + vmsToAdd + " Virtual Machines ");
-        String writeString = totalLoad / MIPS + "\t" + getVmsCreatedList().size() + "\t" + avWaitingTime;
-        bw.write(writeString);
-        bw.newLine();
-        bw.flush();
-        return vmsToAdd;
-    }
-
-    protected int getBestVmIndex() {
-
-        int vmSelected = 0;
-        if (this.lbAlgo.equals("qlen")) {
-            double vmJobCount;
-            vmJobCount = getVmsToJobCountMap().get(getVmsCreatedList().get(0).getId());
-            for (int i = 1; i < getVmsCreatedList().size(); i++) {
-                if (vmJobCount > getVmsToJobCountMap().get(getVmsCreatedList().get(i).getId())) {
-                    TranscodingVm vm = (TranscodingVm) getVmsCreatedList().get(i);
-                    if (vm.getCloseToComplete() == false) {
-                        vmJobCount = getVmsToJobCountMap().get(getVmsCreatedList().get(i).getId());
-                        vmSelected = i;
-                    }
-                }
-            }
-        } else {
-            long vmJobLoad;
-            vmJobLoad = getVmsToJobLoadMap().get(getVmsCreatedList().get(0).getId());
-            for (int i = 1; i < getVmsCreatedList().size(); i++) {
-                //Log.printLine("prev load = " + vmJobLoad + " curr load" +getVmsToJobLoadMap().get(getVmsCreatedList().get(i).getId()) );
-                if (vmJobLoad > getVmsToJobLoadMap().get(getVmsCreatedList().get(i).getId())) {
-                    //Log.printLine("*****I am here*****");
-                    TranscodingVm vm = (TranscodingVm) getVmsCreatedList().get(i);
-                    if (vm.getCloseToComplete() == false) {
-                        vmJobLoad = getVmsToJobLoadMap().get(getVmsCreatedList().get(i).getId());
-                        vmSelected = i;
-                    }
-                }
-            }
-        }
-        return vmSelected;
-
-    }
-
     /**
      * Sets the vms to datacenters map.
      *
      * @param vmsToDatacentersMap the vms to datacenters map
      */
     protected void setVmsToJobCountMap(Map<Integer, Integer> vmsToJobCountMap) {
-        this.VmsToJobCountMap = vmsToJobCountMap;
+        this.vmsToJobCountMap = vmsToJobCountMap;
     }
 
     protected Map<Integer, Integer> getVmsToJobCountMap() {
-        return VmsToJobCountMap;
+        return vmsToJobCountMap;
     }
 
     protected void setVmsToJobLoadMap(Map<Integer, Long> vmsToJobLoadMap) {
-        this.VmsToJobLoadMap = vmsToJobLoadMap;
+        this.vmsToJobLoadMap = vmsToJobLoadMap;
     }
 
     protected Map<Integer, Long> getVmsToJobLoadMap() {
-        return VmsToJobLoadMap;
+        return vmsToJobLoadMap;
+    }
+
+    protected void setVmsToActualJobLoadMap(Map<Integer, Long> vmsToActualJobLoadMap) {
+        this.vmsToActualJobLoadMap = vmsToActualJobLoadMap;
+    }
+
+    protected Map<Integer, Long> getVmsToActualJobLoadMap() {
+        return vmsToActualJobLoadMap;
+    }
+
+    protected void setVmsToFramesMap(Map<Integer, Long> vmsToFramesMap) {
+        this.vmsToFramesMap = vmsToFramesMap;
+    }
+
+    protected Map<Integer, Long> getVmsToFramesMap() {
+        return vmsToFramesMap;
+    }
+
+    protected void setAvWaitingTime(Mean avWaitingTime) {
+        this.avWaitingTime = avWaitingTime;
+    }
+
+    protected Mean getAvWaitingTime() {
+        return avWaitingTime;
     }
 
     public void setLbAlgo(String lbAlgo) {
@@ -981,7 +1008,7 @@ public class TranscodingDatacenterBroker extends SimEntity {
     public BufferedWriter getResultWriter() {
         return this.bw;
     }
-    
+
     public void setEndOfSimulation(boolean endOfSimulation) {
         this.endOfSimulation = endOfSimulation;
     }

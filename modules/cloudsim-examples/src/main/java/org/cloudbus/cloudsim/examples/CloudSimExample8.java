@@ -18,6 +18,7 @@ import java.util.List;
 
 import org.cloudbus.cloudsim.Cloudlet;
 import org.cloudbus.cloudsim.CloudletSchedulerTimeShared;
+import org.cloudbus.cloudsim.CloudletSchedulerSpaceShared;
 import org.cloudbus.cloudsim.Datacenter;
 import org.cloudbus.cloudsim.DatacenterBroker;
 import org.cloudbus.cloudsim.DatacenterCharacteristics;
@@ -36,6 +37,7 @@ import org.cloudbus.cloudsim.core.SimEvent;
 import org.cloudbus.cloudsim.provisioners.BwProvisionerSimple;
 import org.cloudbus.cloudsim.provisioners.PeProvisionerSimple;
 import org.cloudbus.cloudsim.provisioners.RamProvisionerSimple;
+import org.apache.commons.math3.stat.descriptive.moment.Mean;
 
 /**
  * An example showing how to create simulation entities
@@ -49,6 +51,8 @@ public class CloudSimExample8 {
 
 	/** The vmList. */
 	private static List<Vm> vmList;
+        
+        private static Mean avWaitingTime;
 
 	private static List<Vm> createVM(int userId, int vms, int idShift) {
 		//Creates a container to store VMs. This list is passed to the broker later
@@ -66,7 +70,7 @@ public class CloudSimExample8 {
 		Vm[] vm = new Vm[vms];
 
 		for(int i=0;i<vms;i++){
-			vm[i] = new Vm(idShift + i, userId, mips, pesNumber, ram, bw, size, vmm, new CloudletSchedulerTimeShared());
+			vm[i] = new Vm(idShift + i, userId, mips, pesNumber, ram, bw, size, vmm, new CloudletSchedulerSpaceShared());
 			list.add(vm[i]);
 		}
 
@@ -116,7 +120,7 @@ public class CloudSimExample8 {
 			// Initialize the CloudSim library
 			CloudSim.init(num_user, calendar, trace_flag);
 
-			GlobalBroker globalBroker = new GlobalBroker("GlobalBroker");
+			//GlobalBroker globalBroker = new GlobalBroker("GlobalBroker");
 
 			// Second step: Create Datacenters
 			//Datacenters are the resource providers in CloudSim. We need at list one of them to run a CloudSim simulation
@@ -130,8 +134,9 @@ public class CloudSimExample8 {
 			int brokerId = broker.getId();
 
 			//Fourth step: Create VMs and Cloudlets and send them to broker
-			vmList = createVM(brokerId, 24, 0); //creating 5 vms
-			cloudletList = createCloudlet(brokerId, 24, 0); // creating 10 cloudlets
+			vmList = createVM(brokerId, 10, 0); //creating 5 vms
+			cloudletList = createCloudlet(brokerId, 50, 0); // creating 10 cloudlets
+                        avWaitingTime = new Mean();
 
 			broker.submitVmList(vmList);
 			broker.submitCloudletList(cloudletList);
@@ -141,7 +146,7 @@ public class CloudSimExample8 {
 
 			// Final step: Print results when simulation is over
 			List<Cloudlet> newList = broker.getCloudletReceivedList();
-			newList.addAll(globalBroker.getBroker().getCloudletReceivedList());
+			//newList.addAll(globalBroker.getBroker().getCloudletReceivedList());
 
 			CloudSim.stopSimulation();
 
@@ -268,19 +273,23 @@ public class CloudSimExample8 {
 		Log.printLine();
 		Log.printLine("========== OUTPUT ==========");
 		Log.printLine("Cloudlet ID" + indent + "STATUS" + indent +
-				"Data center ID" + indent + "VM ID" + indent + indent + "Time" + indent + "Start Time" + indent + "Finish Time");
+				"Data center ID" + indent + "VM ID" + indent + indent + "Time" + indent + "Start Time" + indent + "Submission" + indent + "Finish Time" + indent + "AvWaitTime");
 
 		DecimalFormat dft = new DecimalFormat("###.##");
 		for (int i = 0; i < size; i++) {
 			cloudlet = list.get(i);
 			Log.print(indent + cloudlet.getCloudletId() + indent + indent);
-
+                        avWaitingTime.increment(cloudlet.getExecStartTime() - cloudlet.getSubmissionTime());
+                        
 			if (cloudlet.getCloudletStatus() == Cloudlet.SUCCESS){
 				Log.print("SUCCESS");
 
 				Log.printLine( indent + indent + cloudlet.getResourceId() + indent + indent + indent + cloudlet.getVmId() +
 						indent + indent + indent + dft.format(cloudlet.getActualCPUTime()) +
-						indent + indent + dft.format(cloudlet.getExecStartTime())+ indent + indent + indent + dft.format(cloudlet.getFinishTime()));
+						indent + indent + dft.format(cloudlet.getExecStartTime())+ 
+                                                indent + indent + indent + dft.format(cloudlet.getSubmissionTime())+
+                                                indent + indent + indent + dft.format(cloudlet.getFinishTime())+
+                                                indent + indent + indent + dft.format(avWaitingTime.getResult()));
 			}
 		}
 
